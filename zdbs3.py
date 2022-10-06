@@ -37,6 +37,8 @@ class S3ZDB:
             'NewMultipartUpload': self.NewMultipartUpload,
             'PutObjectPart': self.PutObjectPart,
             'CompleteMultipartUpload': self.CompleteMultipartUpload,
+            'DeleteMultipleObjects': self.DeleteMultipleObjects,
+            'DeleteObject': self.DeleteObject,
         }
 
 
@@ -46,6 +48,8 @@ class S3ZDB:
 
     def HeadObject(self, bucket, name):
         metadata = self.fetchmeta(bucket, name)
+        if metadata == None:
+            return self.error("ObjectNotFound", "Object not found", 404)
 
         keytime = g.zdb.execute_command("KEYTIME", name)
 
@@ -59,6 +63,8 @@ class S3ZDB:
 
     def GetObject(self, bucket, name):
         metadata = self.fetchmeta(bucket, name)
+        if metadata == None:
+            return self.error("ObjectNotFound", "Object not found", 404)
 
         keytime = g.zdb.execute_command("KEYTIME", name)
 
@@ -102,29 +108,33 @@ class S3ZDB:
         """
 
         root = self.replier('ListBucketResult')
+        prefix = request.args.get("prefix")
 
         self.setmeta(bucket)
 
         self.append(root, 'Name', bucket)
-        self.append(root, 'Prefix', "")
+        self.append(root, 'Prefix', prefix)
         self.append(root, 'KeyCount', "42")
         self.append(root, 'MaxKeys', "1000")
         self.append(root, 'Delimiter', "/")
         self.append(root, 'IsTruncated', "false")
 
-
         items = g.zdb.execute_command("SCAN")
 
         for entry in items[1]:
+            name = entry[0].decode('utf-8')
+            if not name.startswith(prefix):
+                continue
+
             contents = self.append(root, "Contents")
 
-            metadata = self.fetchmeta(bucket, entry[0].decode('utf-8'))
+            metadata = self.fetchmeta(bucket, name)
 
             owner = self.append(contents, 'Owner')
             self.append(owner, 'ID', '02d6176db174dc93cb1b899f7c6078f08654445fe8cf1b6ce98d8855f66bdbf4')
             self.append(owner, 'DisplayName', 'HelloWorld')
 
-            self.append(contents, 'Key', entry[0].decode('utf-8'))
+            self.append(contents, 'Key', name)
             self.append(contents, 'LastModified', '2022-10-05T22:25:47.026Z')
             self.append(contents, 'ETag', '42')
             self.append(contents, 'Size', str(metadata['size']))
@@ -372,6 +382,43 @@ class S3ZDB:
 
         return self.response(root)
 
+    def DeleteObject(self, bucket, name):
+        self.setmeta(bucket)
+        g.zdb.execute_command("DEL", name)
+
+        return self.empty()
+
+    def DeleteMultipleObjects(self, bucket):
+        """
+        <Delete>
+            <Quiet>false</Quiet>
+            <Object>
+                <Key>file-100m</Key>
+            </Object>
+        </Delete>
+        """
+        print(request.data)
+
+        partlist = et.fromstring(request.data)
+        print(partlist)
+
+        root = self.replier('DeleteResult')
+        deleted = self.append(root, 'Deleted')
+
+        for key in partlist.iter('Key'):
+            try:
+                g.zdb.execute_command("DEL", key.text)
+                self.append(deleted, 'Key', key.text)
+
+            except Exception as e:
+                print(e)
+
+        return self.response(root)
+
+
+
+
+
 
     def exists(self, bucket):
         try:
@@ -385,6 +432,9 @@ class S3ZDB:
         self.setmeta(bucket)
 
         metadata = g.zdb.get(name)
+        if metadata == None:
+            return None
+
         return json.loads(metadata.decode('utf-8'))
 
     def commit(self, payload, digest):
@@ -471,7 +521,7 @@ class S3ZDB:
         def route_default():
             return self.call('ListBuckets')
 
-        @self.app.route('/<bucket>/', methods=['HEAD', 'GET', 'PUT', 'DELETE'])
+        @self.app.route('/<bucket>/', methods=['HEAD', 'GET', 'PUT', 'POST', 'DELETE'])
         def route_buckets(bucket):
             if request.method == "PUT":
                 return self.call('PutBucket', bucket=bucket)
@@ -491,6 +541,10 @@ class S3ZDB:
 
                 return self.NotImplemented()
 
+            if request.method == "POST":
+                if request.args.get("delete", None) != None:
+                    return self.call('DeleteMultipleObjects', bucket=bucket)
+
             if request.method == "HEAD":
                 return self.call('HeadBucket', bucket=bucket)
 
@@ -499,8 +553,11 @@ class S3ZDB:
 
             return self.NotImplemented()
 
-        @self.app.route('/<bucket>/<name>', methods=['HEAD', 'GET', 'PUT', 'POST'])
+        @self.app.route('/<bucket>/', defaults={'name': ''})
+        @self.app.route('/<bucket>/<path:name>', methods=['HEAD', 'GET', 'PUT', 'POST', 'DELETE'])
         def route_bucket_object(bucket, name):
+            print(bucket, name)
+
             if request.method == "HEAD":
                 return self.call('HeadObject', bucket=bucket, name=name)
 
@@ -519,6 +576,9 @@ class S3ZDB:
 
                 if request.args.get("uploadId", None) != None:
                     return self.call('CompleteMultipartUpload', bucket=bucket, name=name)
+
+            if request.method == "DELETE":
+                return self.call('DeleteObject', bucket=bucket, name=name)
 
             return self.NotImplemented()
 
